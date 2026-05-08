@@ -1,0 +1,75 @@
+name: Track upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "29 3 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: track-upstream
+  cancel-in-progress: false
+
+jobs:
+  track-upstream:
+    runs-on: ubuntu-latest
+    env:
+      BASE_BRANCH: main
+      MIRROR_BRANCH: upstream-main
+      SYNC_BRANCH: upstream-sync
+      UPSTREAM_REPO: https://github.com/ilysenko/codex-desktop-linux.git
+      UPSTREAM_SLUG: ilysenko/codex-desktop-linux
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and refresh tracking branches
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$BASE_BRANCH"
+          git branch -f "$MIRROR_BRANCH" "upstream/$BASE_BRANCH"
+          git push --force origin "$MIRROR_BRANCH"
+          git checkout -B "$SYNC_BRANCH" "origin/$BASE_BRANCH"
+          git merge --no-ff --no-edit "upstream/$BASE_BRANCH" || {
+            echo "Merge conflict while integrating upstream."
+            exit 1
+          }
+
+      - name: Open pull request when upstream changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet "origin/$BASE_BRANCH" "$SYNC_BRANCH"; then
+            echo "No upstream change to propose."
+            exit 0
+          fi
+
+          git push --force origin "$SYNC_BRANCH"
+
+          existing_pr="$(gh pr list \
+            --base "$BASE_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ -n "$existing_pr" ]; then
+            echo "Pull request #$existing_pr already open."
+            exit 0
+          fi
+
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --title "chore: sync upstream $(date -u +%F)" \
+            --body "Tracks the latest changes from \`$UPSTREAM_SLUG\` into \`$BASE_BRANCH\`."
