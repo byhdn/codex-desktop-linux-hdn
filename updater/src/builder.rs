@@ -14,7 +14,7 @@ use std::{
 use tokio::process::Command;
 use tracing::info;
 
-const REQUIRED_BUNDLE_FILES: [(&str, &str); 13] = [
+const REQUIRED_BUNDLE_FILES: [(&str, &str); 15] = [
     ("Cargo.toml", "Cargo.toml"),
     ("Cargo.lock", "Cargo.lock"),
     ("computer-use-linux", "computer-use-linux"),
@@ -25,6 +25,7 @@ const REQUIRED_BUNDLE_FILES: [(&str, &str); 13] = [
     ),
     ("install.sh", "install.sh"),
     ("launcher/start.sh.template", "launcher/start.sh.template"),
+    ("launcher/webview-server.py", "launcher/webview-server.py"),
     ("scripts/build-deb.sh", "scripts/build-deb.sh"),
     (
         "scripts/patch-linux-window-ui.js",
@@ -34,6 +35,7 @@ const REQUIRED_BUNDLE_FILES: [(&str, &str); 13] = [
     ("scripts/lib", "scripts/lib"),
     ("packaging/linux", "packaging/linux"),
     ("assets/codex.png", "assets/codex.png"),
+    ("linux-features", "linux-features"),
 ];
 const OPTIONAL_BUNDLE_FILES: [(&str, &str); 3] = [
     ("scripts/build-rpm.sh", "scripts/build-rpm.sh"),
@@ -491,6 +493,19 @@ touch "${DIST_DIR_OVERRIDE}/codex-desktop-${VER}-1-x86_64.pkg.tar.zst"
         Ok(())
     }
 
+    fn write_fake_linux_features_bundle(root: &Path) -> Result<()> {
+        fs::create_dir_all(root.join("linux-features/example-feature"))?;
+        fs::write(
+            root.join("linux-features/features.example.json"),
+            b"{\"enabled\":[]}\n",
+        )?;
+        fs::write(
+            root.join("linux-features/example-feature/feature.json"),
+            b"{\"id\":\"example-feature\"}\n",
+        )?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn builds_update_with_fake_bundle() -> Result<()> {
         let temp = tempdir()?;
@@ -503,9 +518,14 @@ touch "${DIST_DIR_OVERRIDE}/codex-desktop-${VER}-1-x86_64.pkg.tar.zst"
         fs::create_dir_all(bundle_root.join("packaging/linux"))?;
         fs::create_dir_all(bundle_root.join("assets"))?;
         write_fake_computer_use_bundle(&bundle_root)?;
+        write_fake_linux_features_bundle(&bundle_root)?;
         fs::write(
             bundle_root.join("launcher/start.sh.template"),
             b"# fake launcher template\n",
+        )?;
+        fs::write(
+            bundle_root.join("launcher/webview-server.py"),
+            b"# fake webview server\n",
         )?;
         fs::write(bundle_root.join("assets/codex.png"), b"png")?;
         fs::write(
@@ -644,11 +664,19 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
             .exists());
         assert!(artifacts
             .workspace_dir
+            .join("builder/launcher/webview-server.py")
+            .exists());
+        assert!(artifacts
+            .workspace_dir
             .join("builder/scripts/lib/node-runtime.sh")
             .exists());
         assert!(artifacts
             .workspace_dir
             .join("builder/scripts/patches/registry.js")
+            .exists());
+        assert!(artifacts
+            .workspace_dir
+            .join("builder/linux-features/features.example.json")
             .exists());
         assert!(
             is_native_package_file(&artifacts.package_path),
@@ -670,10 +698,15 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
         fs::create_dir_all(source_root.join("packaging/linux"))?;
         fs::create_dir_all(source_root.join("assets"))?;
         write_fake_computer_use_bundle(&source_root)?;
+        write_fake_linux_features_bundle(&source_root)?;
         fs::write(source_root.join("install.sh"), b"#!/bin/bash\n")?;
         fs::write(
             source_root.join("launcher/start.sh.template"),
             b"# fake launcher template\n",
+        )?;
+        fs::write(
+            source_root.join("launcher/webview-server.py"),
+            b"# fake webview server\n",
         )?;
         fs::write(source_root.join("scripts/build-deb.sh"), b"#!/bin/bash\n")?;
         fs::write(
@@ -708,6 +741,7 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
         assert!(destination_root
             .join("scripts/patch-linux-window-ui.js")
             .exists());
+        assert!(destination_root.join("launcher/webview-server.py").exists());
         assert!(destination_root
             .join("scripts/patches/registry.js")
             .exists());
@@ -718,6 +752,9 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
             .exists());
         assert!(destination_root
             .join("scripts/lib/node-runtime.sh")
+            .exists());
+        assert!(destination_root
+            .join("linux-features/features.example.json")
             .exists());
         assert!(!destination_root.join("scripts/build-rpm.sh").exists());
         assert!(!destination_root.join("scripts/build-pacman.sh").exists());

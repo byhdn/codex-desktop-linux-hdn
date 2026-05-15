@@ -126,7 +126,10 @@ function applyLinuxSetIconPatch(currentSource, iconAsset) {
 }
 
 function applyLinuxOpaqueBackgroundPatch(currentSource) {
-  if (currentSource.includes("===`linux`&&!OM(")) {
+  if (
+    currentSource.includes("===`linux`&&!OM(") ||
+    /===`linux`&&![A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\?\{backgroundColor:[^{}]+,backgroundMaterial:null\}/.test(currentSource)
+  ) {
     return currentSource;
   }
 
@@ -212,13 +215,18 @@ function applyLinuxQuitGuardPatch(currentSource) {
   let patchedSource = currentSource;
 
   const quitGuardNeedle = "let n=require(`electron`),i=require(`node:path`),o=require(`node:fs`);";
-  const quitGuardPatch =
-    "let n=require(`electron`),i=require(`node:path`),o=require(`node:fs`);let codexLinuxQuitInProgress=!1,codexLinuxMarkQuitInProgress=()=>{codexLinuxQuitInProgress=!0},codexLinuxIsQuitInProgress=()=>codexLinuxQuitInProgress===!0;";
-  const quitGuardSuffix =
+  const legacyQuitGuardSuffix =
     "let codexLinuxQuitInProgress=!1,codexLinuxMarkQuitInProgress=()=>{codexLinuxQuitInProgress=!0},codexLinuxIsQuitInProgress=()=>codexLinuxQuitInProgress===!0;";
+  const quitGuardSuffix =
+    "let codexLinuxQuitInProgress=!1,codexLinuxExplicitQuitApproved=!1,codexLinuxExplicitQuitDrainTimeoutMs=3e3,codexLinuxMarkQuitInProgress=()=>{codexLinuxQuitInProgress=!0},codexLinuxPrepareForExplicitQuit=()=>{codexLinuxExplicitQuitApproved=!0,codexLinuxMarkQuitInProgress()},codexLinuxShouldBypassQuitPrompt=()=>codexLinuxExplicitQuitApproved===!0,codexLinuxIsQuitInProgress=()=>codexLinuxQuitInProgress===!0;";
+  const quitGuardPatch = `${quitGuardNeedle}${quitGuardSuffix}`;
 
-  if (patchedSource.includes("codexLinuxQuitInProgress=!1,codexLinuxMarkQuitInProgress=()=>{codexLinuxQuitInProgress=!0},codexLinuxIsQuitInProgress=()=>codexLinuxQuitInProgress===!0;")) {
+  if (patchedSource.includes("codexLinuxExplicitQuitApproved=!1")) {
     return patchedSource;
+  }
+
+  if (patchedSource.includes(legacyQuitGuardSuffix)) {
+    return patchedSource.replace(legacyQuitGuardSuffix, quitGuardSuffix);
   }
 
   if (patchedSource.includes(quitGuardNeedle)) {
@@ -239,6 +247,141 @@ function applyLinuxQuitGuardPatch(currentSource) {
 
   if (patchedSource.includes("require(`electron`)") && patchedSource.includes("require(`node:path`)")) {
     console.warn("WARN: Could not find Linux quit guard insertion point — skipping explicit quit-state patch");
+  }
+
+  return patchedSource;
+}
+
+function linuxExplicitQuitExpression() {
+  return "typeof codexLinuxPrepareForExplicitQuit===`function`?codexLinuxPrepareForExplicitQuit():typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress(),";
+}
+
+function applyLinuxWillQuitDrainTimeoutPatch(currentSource) {
+  let patchedSource = currentSource;
+
+  const explicitQuitDrainGuard =
+    "process.platform===`linux`&&(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress())";
+  const originalDrainSnippet =
+    "Promise.all([...u.values()].map(e=>e.flush())).finally(()=>{d(),f.dispose(),n.app.quit()})";
+  const patchedDrainSnippet =
+    "(()=>{let codexLinuxFinalizeQuit=()=>{d(),f.dispose(),n.app.quit()},codexLinuxDrainPromise=Promise.all([...u.values()].map(e=>e.flush()));" +
+    `if(${explicitQuitDrainGuard}){Promise.race([codexLinuxDrainPromise,new Promise(e=>setTimeout(e,typeof codexLinuxExplicitQuitDrainTimeoutMs===\`number\`?codexLinuxExplicitQuitDrainTimeoutMs:3e3))]).finally(codexLinuxFinalizeQuit);return}` +
+    "codexLinuxDrainPromise.finally(codexLinuxFinalizeQuit)})()";
+
+  if (patchedSource.includes("codexLinuxDrainPromise=Promise.all([...u.values()].map(e=>e.flush()))")) {
+    return patchedSource;
+  }
+
+  if (patchedSource.includes(originalDrainSnippet)) {
+    return patchedSource.replace(originalDrainSnippet, patchedDrainSnippet);
+  }
+
+  const drainRegex =
+    /Promise\.all\(\[\.\.\.([A-Za-z_$][\w$]*)\.values\(\)\]\.map\(e=>e\.flush\(\)\)\)\.finally\(\(\)=>\{([A-Za-z_$][\w$]*)\(\),([A-Za-z_$][\w$]*)\.dispose\(\),([A-Za-z_$][\w$]*)\.app\.quit\(\)\}\)/;
+  if (drainRegex.test(patchedSource)) {
+    patchedSource = patchedSource.replace(
+      drainRegex,
+      (_match, globalStatesVar, flushDisposeVar, disposablesVar, electronVar) =>
+        `(()=>{let codexLinuxFinalizeQuit=()=>{${flushDisposeVar}(),${disposablesVar}.dispose(),${electronVar}.app.quit()},codexLinuxDrainPromise=Promise.all([...${globalStatesVar}.values()].map(e=>e.flush()));if(${explicitQuitDrainGuard}){Promise.race([codexLinuxDrainPromise,new Promise(e=>setTimeout(e,typeof codexLinuxExplicitQuitDrainTimeoutMs===\`number\`?codexLinuxExplicitQuitDrainTimeoutMs:3e3))]).finally(codexLinuxFinalizeQuit);return}codexLinuxDrainPromise.finally(codexLinuxFinalizeQuit)})()`,
+    );
+  } else if (
+    patchedSource.includes("n.app.on(`will-quit`,") &&
+    patchedSource.includes(".map(e=>e.flush())")
+  ) {
+    console.warn("WARN: Could not find will-quit drain sequence — skipping Linux explicit quit drain timeout patch");
+  }
+
+  return patchedSource;
+}
+
+function applyLinuxExplicitQuitPromptBypassPatch(currentSource) {
+  let patchedSource = currentSource;
+
+  const promptBypassExpression =
+    "(typeof codexLinuxShouldBypassQuitPrompt===`function`&&codexLinuxShouldBypassQuitPrompt())||";
+  const promptBypassGuard = `if(${promptBypassExpression}`;
+  const beforeQuitNeedle =
+    "if(e||i.canQuitWithoutPrompt()||r||!s&&!c){g=!0,a.markAppQuitting();return}";
+  const beforeQuitPatch =
+    `if(${promptBypassExpression}e||i.canQuitWithoutPrompt()||r||!s&&!c){g=!0,a.markAppQuitting();return}`;
+  const beforeQuitRegex =
+    /if\(([A-Za-z_$][\w$]*)\|\|([A-Za-z_$][\w$]*)\.canQuitWithoutPrompt\(\)\|\|([A-Za-z_$][\w$]*)\|\|!([A-Za-z_$][\w$]*)&&!([A-Za-z_$][\w$]*)\)\{([A-Za-z_$][\w$]*)=!0,([A-Za-z_$][\w$]*)\.markAppQuitting\(\);return\}/;
+
+  if (patchedSource.includes(promptBypassGuard)) {
+    return patchedSource;
+  }
+
+  if (patchedSource.includes(beforeQuitNeedle)) {
+    return patchedSource.replace(beforeQuitNeedle, beforeQuitPatch);
+  }
+
+  if (beforeQuitRegex.test(patchedSource)) {
+    patchedSource = patchedSource.replace(
+      beforeQuitRegex,
+      (_match, updateInstallVar, quitControllerVar, appQuittingVar, activeConversationVar, automationVar, quittingStateVar, appQuittingControllerVar) =>
+        `if(${promptBypassExpression}${updateInstallVar}||${quitControllerVar}.canQuitWithoutPrompt()||${appQuittingVar}||!${activeConversationVar}&&!${automationVar}){${quittingStateVar}=!0,${appQuittingControllerVar}.markAppQuitting();return}`,
+    );
+  } else if (
+    patchedSource.includes("showMessageBoxSync({type:`warning`,buttons:[`Quit`,`Cancel`]") &&
+    patchedSource.includes(".canQuitWithoutPrompt()")
+  ) {
+    console.warn("WARN: Could not find before-quit confirmation guard — skipping Linux explicit quit prompt bypass patch");
+  }
+
+  return patchedSource;
+}
+
+function applyLinuxExplicitTrayQuitPatch(currentSource) {
+  let patchedSource = currentSource;
+
+  const quitMarkerExpression = linuxExplicitQuitExpression();
+
+  const trayQuitNeedle = "{label:rB(this.appName),click:()=>{n.app.quit()}}";
+  const trayQuitPatch =
+    `{label:rB(this.appName),click:()=>{${quitMarkerExpression}n.app.quit()}}`;
+  const trayQuitRegex =
+    /\{label:rB\(([^)]+)\),click:\(\)=>\{([A-Za-z_$][\w$]*)\.app\.quit\(\)\}\}/;
+  if (patchedSource.includes(trayQuitPatch)) {
+    // Already patched.
+  } else if (patchedSource.includes(trayQuitNeedle)) {
+    patchedSource = patchedSource.replace(trayQuitNeedle, trayQuitPatch);
+  } else if (trayQuitRegex.test(patchedSource)) {
+    patchedSource = patchedSource.replace(
+      trayQuitRegex,
+      (_match, appNameExpr, electronVar) =>
+        `{label:rB(${appNameExpr}),click:()=>{${quitMarkerExpression}${electronVar}.app.quit()}}`,
+    );
+  } else if (
+    patchedSource.includes("getNativeTrayMenuItems(){") &&
+    (patchedSource.includes("label:rB(") || patchedSource.includes("role:`quit`"))
+  ) {
+    console.warn("WARN: Could not find tray quit menu handler — skipping Linux explicit tray quit patch");
+  }
+
+  return patchedSource;
+}
+
+function applyLinuxExplicitIpcQuitPatch(currentSource) {
+  let patchedSource = currentSource;
+
+  const quitMarkerExpression = linuxExplicitQuitExpression();
+
+  const quitAppNeedle = "if(o.type===`quit-app`){n.app.quit();return}";
+  const quitAppPatch = `if(o.type===\`quit-app\`){${quitMarkerExpression}n.app.quit();return}`;
+  const quitAppRegex =
+    /if\(([A-Za-z_$][\w$]*)\.type===`quit-app`\)\{([A-Za-z_$][\w$]*)\.app\.quit\(\);return\}/;
+  if (patchedSource.includes(quitAppPatch)) {
+    // Already patched.
+  } else if (patchedSource.includes(quitAppNeedle)) {
+    patchedSource = patchedSource.replace(quitAppNeedle, quitAppPatch);
+  } else if (quitAppRegex.test(patchedSource)) {
+    patchedSource = patchedSource.replace(
+      quitAppRegex,
+      (_match, messageVar, electronVar) =>
+        `if(${messageVar}.type===\`quit-app\`){${quitMarkerExpression}${electronVar}.app.quit();return}`,
+    );
+  } else if (patchedSource.includes("type===`quit-app`")) {
+    console.warn("WARN: Could not find quit-app IPC handler — skipping Linux explicit quit-app patch");
   }
 
   return patchedSource;
@@ -486,6 +629,134 @@ function applyBrowserUseNodeReplApprovalPatch(currentSource) {
   return currentSource.replace(needle, approvalPatch);
 }
 
+function applyLinuxBrowserUseIabVisibleOnCreatePatch(currentSource) {
+  const marker = "codexLinuxBrowserUseAutoVisible";
+  if (currentSource.includes(marker)) {
+    return currentSource;
+  }
+
+  const visibilityExpr = (hostExpr, sessionExpr) =>
+    `(()=>{try{${hostExpr}.setBrowserVisibleForBrowserUse(!0,${sessionExpr}.turnId)}catch(__codexLinuxErr){console.warn("${marker}",__codexLinuxErr?.message??__codexLinuxErr)}})()`;
+  const createTabRegex =
+    /if\(([A-Za-z_$][\w$]*)!=null\)return await this\.navigateTabToInitialPage\(\1\),this\.serializeTab\(\1\);let ([A-Za-z_$][\w$]*)=this\.getRequiredBrowserHost\(([A-Za-z_$][\w$]*)\);\2\.setBrowserUseActive\(!0,\3\.turnId\);let ([A-Za-z_$][\w$]*)=await \2\.openPageForBrowserUse\(\{startingUrl:this\.initialPageUrl,turnId:\3\.turnId\}\),([A-Za-z_$][\w$]*)=this\.updateTabForPage\(\4,\2\.routeKey\);return/;
+  const match = currentSource.match(createTabRegex);
+  if (match == null) {
+    if (
+      currentSource.includes("createTabForBrowserUse") &&
+      currentSource.includes("openPageForBrowserUse")
+    ) {
+      console.warn(
+        "WARN: Could not find Browser Use IAB tab creation point — skipping Linux IAB visibility patch",
+      );
+    }
+    return currentSource;
+  }
+
+  const [needle, tabVar, hostVar, sessionVar, pageVar, tabInfoVar] = match;
+  const activeTabVisibility = visibilityExpr(
+    `this.getRequiredBrowserHost(${sessionVar})`,
+    sessionVar,
+  );
+  const newTabVisibility = visibilityExpr(hostVar, sessionVar);
+  const replacement =
+    `if(${tabVar}!=null)return await this.navigateTabToInitialPage(${tabVar}),${activeTabVisibility},this.serializeTab(${tabVar});` +
+    `let ${hostVar}=this.getRequiredBrowserHost(${sessionVar});${hostVar}.setBrowserUseActive(!0,${sessionVar}.turnId);` +
+    `let ${pageVar}=await ${hostVar}.openPageForBrowserUse({startingUrl:this.initialPageUrl,turnId:${sessionVar}.turnId}),${tabInfoVar}=this.updateTabForPage(${pageVar},${hostVar}.routeKey);` +
+    `return ${newTabVisibility},`;
+
+  return currentSource.replace(needle, replacement);
+}
+
+function applyLinuxChromeExtensionStatusPatch(currentSource) {
+  if (currentSource.includes("codexLinuxChromeProfileRoots")) {
+    return currentSource;
+  }
+
+  const fsVar = requireName(currentSource, "node:fs");
+  const osVar = requireName(currentSource, "node:os");
+  const pathVar = requireName(currentSource, "node:path");
+  if (fsVar == null || osVar == null || pathVar == null) {
+    console.warn(
+      "WARN: Could not find fs/os/path aliases — skipping Linux Chrome extension status patch",
+    );
+    return currentSource;
+  }
+
+  const unsupportedMessage =
+    "Opening Chrome extension settings is only supported on macOS and Windows";
+  const unsupportedMessageIndex = currentSource.indexOf(unsupportedMessage);
+  const openFunctionStart =
+    unsupportedMessageIndex === -1
+      ? -1
+      : currentSource.lastIndexOf("async function ", unsupportedMessageIndex);
+  const blockStart =
+    openFunctionStart === -1
+      ? -1
+      : currentSource.lastIndexOf("function ", openFunctionStart - 1);
+  const blockEnd =
+    openFunctionStart === -1
+      ? -1
+      : currentSource.indexOf("function ", openFunctionStart + "async function ".length);
+  const originalBlock = blockEnd === -1 ? null : currentSource.slice(blockStart, blockEnd);
+  if (
+    blockStart === -1 ||
+    blockEnd === -1 ||
+    !originalBlock.includes(unsupportedMessage)
+  ) {
+    console.warn(
+      "WARN: Could not find Chrome extension status functions — skipping Linux Chrome extension status patch",
+    );
+    return currentSource;
+  }
+
+  const statusFunctionName = /^function ([A-Za-z_$][\w$]*)\(\{extensionId:/.exec(
+    originalBlock,
+  )?.[1];
+  const openFunctionName = /async function ([A-Za-z_$][\w$]*)\(\{extensionId:/.exec(
+    originalBlock,
+  )?.[1];
+  const detectChromeFunctionName =
+    /detectChromeCommand:[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)/.exec(originalBlock)?.[1];
+  const runCommandFunctionName =
+    /runCommand:[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)/.exec(originalBlock)?.[1];
+  const extensionUrlFunctionName = /await [A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*,\[([A-Za-z_$][\w$]*)\(e\)\]\)/.exec(
+    originalBlock,
+  )?.[1];
+  const macOpenFunctionName = /await [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*),\[`-b`,/.exec(
+    originalBlock,
+  )?.[1];
+  const macBundleIdName = /await [A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*,\[`-b`,([A-Za-z_$][\w$]*),/.exec(
+    originalBlock,
+  )?.[1];
+  const extensionIdValidatorName = /let [A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(e\),/.exec(
+    originalBlock,
+  )?.[1];
+  const profileDirFunctionName = /[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(\{homeDir:/.exec(
+    originalBlock,
+  )?.[1];
+  if (
+    statusFunctionName == null ||
+    openFunctionName == null ||
+    detectChromeFunctionName == null ||
+    runCommandFunctionName == null ||
+    extensionUrlFunctionName == null ||
+    macOpenFunctionName == null ||
+    macBundleIdName == null ||
+    extensionIdValidatorName == null ||
+    profileDirFunctionName == null
+  ) {
+    console.warn(
+      "WARN: Could not identify Chrome extension status helper names — skipping Linux Chrome extension status patch",
+    );
+    return currentSource;
+  }
+
+  const replacement =
+    `function codexLinuxChromeProfileRoots({homeDir:e,platform:t}){return t===\`linux\`?[(0,${pathVar}.join)(e,\`.config\`,\`BraveSoftware\`,\`Brave-Browser\`),(0,${pathVar}.join)(e,\`.config\`,\`google-chrome\`),(0,${pathVar}.join)(e,\`.config\`,\`google-chrome-beta\`),(0,${pathVar}.join)(e,\`.config\`,\`google-chrome-unstable\`),(0,${pathVar}.join)(e,\`.config\`,\`chromium\`)]:[]}function codexLinuxChromeHasExtension({extensionId:e,homeDir:t,platform:n}){if(n!==\`linux\`)return!1;let r=${extensionIdValidatorName}(e);for(let e of codexLinuxChromeProfileRoots({homeDir:t,platform:n})){if(!(0,${fsVar}.existsSync)(e))continue;for(let t of (0,${fsVar}.readdirSync)(e,{withFileTypes:!0}))if(t.isDirectory()&&(0,${fsVar}.existsSync)((0,${pathVar}.join)(e,t.name,\`Extensions\`,r)))return!0}return!1}function codexLinuxChromeCommand(){let e=(process.env.PATH??\`\`).split(\`:\`);for(let t of[\`brave-browser\`,\`brave\`,\`google-chrome\`,\`google-chrome-stable\`,\`chromium-browser\`,\`chromium\`])for(let n of e){if(n.length===0)continue;let e=(0,${pathVar}.join)(n,t);try{if((0,${fsVar}.existsSync)(e)&&(0,${fsVar}.statSync)(e).isFile())return e}catch{}}return null}function ${statusFunctionName}({extensionId:e,homeDir:t=(0,${osVar}.homedir)(),localAppDataDir:n=process.env.LOCALAPPDATA,platform:a=process.platform}){if(a===\`linux\`)return codexLinuxChromeHasExtension({extensionId:e,homeDir:t,platform:a});let s=${extensionIdValidatorName}(e),c=${profileDirFunctionName}({homeDir:t,localAppDataDir:n,platform:a});return c==null||!(0,${fsVar}.existsSync)(c)?!1:(0,${fsVar}.readdirSync)(c,{withFileTypes:!0}).some(e=>e.isDirectory()&&(0,${fsVar}.existsSync)((0,${pathVar}.join)(c,e.name,\`Extensions\`,s)))}async function ${openFunctionName}({extensionId:e,platform:t=process.platform,detectChromeCommand:n=${detectChromeFunctionName},runCommand:r=${runCommandFunctionName}}){if(t===\`darwin\`){await r(${macOpenFunctionName},[\`-b\`,${macBundleIdName},${extensionUrlFunctionName}(e)]);return}if(t===\`win32\`){let t=n();if(t==null)throw Error(\`Google Chrome is not installed\`);await r(t,[${extensionUrlFunctionName}(e)]);return}if(t===\`linux\`){let t=codexLinuxChromeCommand()??n();if(t==null)throw Error(\`Google Chrome, Brave, or Chromium is not installed\`);await r(t,[${extensionUrlFunctionName}(e)]);return}throw Error(\`Opening Chrome extension settings is only supported on macOS, Windows, and Linux\`)}`;
+
+  return currentSource.slice(0, blockStart) + replacement + currentSource.slice(blockEnd);
+}
+
 function applyLinuxGitOriginsSourceFallbackPatch(currentSource) {
   const fallbackSource = "linux_git_origins_missing_source_fallback";
   if (currentSource.includes(`source:\`${fallbackSource}\`,requestKind:`)) {
@@ -499,15 +770,22 @@ function applyLinuxGitOriginsSourceFallbackPatch(currentSource) {
   if (currentSource.includes(exactNeedle)) {
     return currentSource.replace(exactNeedle, exactReplacement);
   }
+  const currentExactNeedle =
+    "if(o==null){if(e.Gt(r))throw Error(`Missing git operation source for ${r}`);return l()}return t.Gt({source:o,requestKind:r},l)";
+  const currentExactReplacement =
+    `if(o==null){if(e.Gt(r)){if(r===\`git-origins\`)return t.Gt({source:\`${fallbackSource}\`,requestKind:r},l);throw Error(\`Missing git operation source for \${r}\`)}return l()}return t.Gt({source:o,requestKind:r},l)`;
+  if (currentSource.includes(currentExactNeedle)) {
+    return currentSource.replace(currentExactNeedle, currentExactReplacement);
+  }
 
   const dynamicRegex =
-    /if\(([A-Za-z_$][\w$]*)==null\)\{if\(([A-Za-z_$][\w$]*)\.qt\(([A-Za-z_$][\w$]*)\)\)throw Error\(`Missing git operation source for \$\{\3\}`\);return ([A-Za-z_$][\w$]*)\(\)\}return ([A-Za-z_$][\w$]*)\.Gt\(\{source:\1,requestKind:\3\},\4\)/;
+    /if\(([A-Za-z_$][\w$]*)==null\)\{if\(([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\)throw Error\(`Missing git operation source for \$\{\4\}`\);return ([A-Za-z_$][\w$]*)\(\)\}return ([A-Za-z_$][\w$]*)\.Gt\(\{source:\1,requestKind:\4\},\5\)/;
   const dynamicMatch = currentSource.match(dynamicRegex);
   if (dynamicMatch != null) {
-    const [, sourceVar, gitGuardVar, requestKindVar, callVar, operationContextVar] = dynamicMatch;
+    const [, sourceVar, gitGuardVar, guardFn, requestKindVar, callVar, operationContextVar] = dynamicMatch;
     return currentSource.replace(
       dynamicRegex,
-      `if(${sourceVar}==null){if(${gitGuardVar}.qt(${requestKindVar})){if(${requestKindVar}===\`git-origins\`)return ${operationContextVar}.Gt({source:\`${fallbackSource}\`,requestKind:${requestKindVar}},${callVar});throw Error(\`Missing git operation source for \${${requestKindVar}}\`)}return ${callVar}()}return ${operationContextVar}.Gt({source:${sourceVar},requestKind:${requestKindVar}},${callVar})`,
+      `if(${sourceVar}==null){if(${gitGuardVar}.${guardFn}(${requestKindVar})){if(${requestKindVar}===\`git-origins\`)return ${operationContextVar}.Gt({source:\`${fallbackSource}\`,requestKind:${requestKindVar}},${callVar});throw Error(\`Missing git operation source for \${${requestKindVar}}\`)}return ${callVar}()}return ${operationContextVar}.Gt({source:${sourceVar},requestKind:${requestKindVar}},${callVar})`,
     );
   }
 
@@ -523,6 +801,11 @@ function applyLinuxGitOriginsSourceFallbackPatch(currentSource) {
 
 module.exports = {
   applyBrowserUseNodeReplApprovalPatch,
+  applyLinuxBrowserUseIabVisibleOnCreatePatch,
+  applyLinuxChromeExtensionStatusPatch,
+  applyLinuxExplicitIpcQuitPatch,
+  applyLinuxExplicitQuitPromptBypassPatch,
+  applyLinuxExplicitTrayQuitPatch,
   applyLinuxFileManagerPatch,
   applyLinuxGitOriginsSourceFallbackPatch,
   applyLinuxMenuPatch,
@@ -531,5 +814,6 @@ module.exports = {
   applyLinuxSetIconPatch,
   applyLinuxSingleInstancePatch,
   applyLinuxTrayPatch,
+  applyLinuxWillQuitDrainTimeoutPatch,
   applyLinuxWindowOptionsPatch,
 };

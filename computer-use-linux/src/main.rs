@@ -1,10 +1,13 @@
 mod atspi_tree;
+mod cosmic_helper;
 mod diagnostics;
 mod gnome_extension;
+mod identity;
 mod remote_desktop;
 mod screenshot;
 mod server;
 mod terminal;
+mod windowing;
 mod windows;
 
 use anyhow::{Context, Result};
